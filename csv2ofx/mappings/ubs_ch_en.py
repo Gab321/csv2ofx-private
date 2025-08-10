@@ -44,22 +44,22 @@ def parse_desc(row):
         combined.append(foot)
     return " / ".join(combined)
 
+def parse_type(row):
+    return "DEBIT" if row["Debit"].strip() else ("CREDIT" if row["Credit"].strip() else "")
+
 mapping = {
     "has_header": True,
     "delimiter": ";",
-
+    "first_row": 9,  # UBS bank export has 9 metadata lines before the real header
     "date": itemgetter("Value date"),
     "parse_fmt": "%Y-%m-%d",
-    "currency": itemgetter("Currency"),
-    "amount": parse_amount,
 
-    # This will become <NAME> in the OFX
+    # safer currency (don't leave it blank if the column is empty on some rows)
+    "currency": lambda r: (r.get("Currency") or "CHF").strip(),
+
+    "amount": parse_amount,   # your function is fine
+    "type": parse_type,       # <-- add this
     "payee": parse_payee,
-
-    # This will become <MEMO> in the OFX
     "desc": parse_desc,
-
-    # If you want a separate <NOTE>, you can define:
-    # "notes": lambda r: r["Footnotes"] or ""
 }
 

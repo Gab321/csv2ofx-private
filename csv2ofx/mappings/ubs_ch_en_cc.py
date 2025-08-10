@@ -1,98 +1,107 @@
-# -*- coding: iso-8859-1 -*-
+# -*- coding: utf-8 -*-
 # vim: sw=4:ts=4:expandtab
 """
-csv2ofx.mappings.ubs-ch-en-cc
+csv2ofx.mappings.ubs_ch_en_cc
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Mapping for a UBS credit card CSV with columns:
-Account number, Card number, Account/Cardholder, Purchase date,
-Booking text, Sector, Amount, Original currency, Rate, Currency,
-Debit, Credit, Booked
-
-We do two things:
-1) Filter out any row lacking a valid Purchase date (blank, etc.).
-2) Stop reading at row -3 (skip the last three lines, which are always summary/blank).
+Robust mapping for UBS credit-card CSV (English), tolerant to:
+- header wording changes (2024 vs 2025),
+- ; delimiter,
+- ISO-8859-1 or UTF-8 encodings,
+- decimal comma and thousands separators,
+- weird text like "DO&amp;CO" (amounts still parsed),
+- optional summary/footer lines (drop with CLI -R -2).
 """
 
-import datetime
-from operator import itemgetter
+import re
+from datetime import datetime
+
+# --- helpers ---------------------------------------------------------------
+
+def _normkeys(row):
+    # case-insensitive, strip spaces and BOM if any
+    return { (k or "").replace("\ufeff","").strip().lower(): v for k, v in row.items() }
+
+def getv(row, *candidates):
+    m = _normkeys(row)
+    for name in candidates:
+        key = (name or "").strip().lower()
+        if key in m and m[key] is not None:
+            return str(m[key])
+    return ""
+
+def _to_num(s):
+    s = (s or "").strip()
+    if not s:
+        return 0.0
+    s = s.replace("\xa0", " ").replace("'", "")  # nbsp + thousands
+    s = s.replace(",", ".")                       # decimal comma -> dot
+    s = re.sub(r"[^\d.\-]", "", s)               # strip CHF, spaces, etc.
+    return float(s) if s else 0.0
+
+def parse_date_iso(row):
+    """
+    Accepts multiple column names and formats and returns an ISO string.
+    2024 exports: 'Purchase date' as dd.mm.yyyy
+    2025 exports sometimes tweak wording/case.
+    """
+    raw = getv(row, "Purchase date", "Transaction date", "Date", "Booking date", "Booked date")
+    raw = raw.strip()
+    # Try common formats
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    # If none matched, leave empty (row will be filtered out)
+    return ""
 
 def parse_amount(row):
-    """
-    Convert Debit => negative, Credit => positive.
-    Example: if 'Debit' is '453.68', that becomes -453.68.
-             if 'Credit' is '12.34', that becomes +12.34.
-    """
-    debit_str = row["Debit"].strip()
-    credit_str = row["Credit"].strip()
-    if debit_str:
-        return -float(debit_str.replace(",", "."))
-    elif credit_str:
-        return float(credit_str.replace(",", "."))
-    return 0.0
+    # Prefer Debit (negative), else Credit (positive), else Amount
+    debit  = getv(row, "Debit", "Debit amount")
+    credit = getv(row, "Credit", "Credit amount")
+    val = _to_num(debit)
+    if val:
+        return -val
+    val = _to_num(credit)
+    if val:
+        return val
+    return _to_num(getv(row, "Amount"))
 
 def parse_payee(row):
-    """Set 'Booking text' as Payee."""
-    return row.get("Booking text", "").strip()
+    # Booking text / Description / Merchant
+    return (getv(row, "Booking text", "Description", "Merchant") or "").strip()
 
 def parse_desc(row):
-    """
-    Combine 'Sector' and 'Booking text' for the memo field.
-    """
-    sector = row.get("Sector", "").strip()
-    booking = row.get("Booking text", "").strip()
-
-    combined = []
+    # Sector / MCC / Category + booking text
+    sector  = (getv(row, "Sector", "MCC", "Category") or "").strip()
+    booking = (getv(row, "Booking text", "Description", "Merchant") or "").strip()
+    parts = []
     if sector:
-        combined.append(f"Sector: {sector}")
+        parts.append(f"Sector: {sector}")
     if booking:
-        combined.append(booking)
+        parts.append(booking)
+    return " / ".join(parts)
 
-    return " / ".join(combined)
+def keep_row(row):
+    # keep row only if a date exists & can be normalized
+    return bool(parse_date_iso(row))
 
-def skip_rows_with_blank_date(row):
-    """
-    Return False if Purchase date is missing or not parseable; True otherwise.
-    """
-    raw_date = row.get("Purchase date", "").strip()
-    if not raw_date:
-        # If there's no Purchase date, skip the row
-        return False
-
-    # Make sure it can parse as dd.mm.yyyy
-    try:
-        datetime.datetime.strptime(raw_date, "%d.%m.%Y")
-    except ValueError:
-        return False
-
-    return True
+# --- mapping ---------------------------------------------------------------
 
 mapping = {
     "has_header": True,
-    "delimiter": ";",            # The file is semicolon-separated.
+    "delimiter": ";",
+    "first_row": 1,        # <-- skip the 'sep=;' line automatically
+    # DO NOT set 'last_row' here; pass -R -2 on older exports when needed.
 
-    # Start at the first row after the header, and stop 3 lines from the end
-    # so we avoid the blank line plus the two summary lines.
-    "first_row": 0,
-    "last_row": -2,
+    "date": parse_date_iso,
+    "parse_fmt": "%Y-%m-%d",
 
-    # This indicates how to parse the date:
-    "date": itemgetter("Purchase date"),
-    "parse_fmt": "%d.%m.%Y",
-
-    # Hard-code currency as CHF (or read from row["Currency"] if desired)
-    "currency": lambda row: "CHF",
-
-    # Turn Debit/Credit columns into a single numeric field
+    "currency": lambda r: (getv(r, "Currency") or "CHF").strip(),
     "amount": parse_amount,
-
-    # Use 'Booking text' as Payee
     "payee": parse_payee,
-
-    # Use 'Sector' + 'Booking text' as Memo
     "desc": parse_desc,
 
-    # Skip rows if there's no valid Purchase date
-    "filter": skip_rows_with_blank_date,
+    "filter": keep_row,
 }
-
